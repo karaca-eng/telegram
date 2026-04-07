@@ -1,215 +1,238 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import requests
+import asyncio
+import json
+import websockets
 import time
 import threading
 from datetime import datetime
+from collections import deque
 
 # --- CONFIGURATION ---
-TELEGRAM_TOKEN = "8650328750:AAGQ-3NlYmpD_Gn5ONUFc59aQYv3UmS2l18"
-TELEGRAM_CHAT_ID = "-1003576447874"
+MIN_VOL_3M = 100000
+MIN_CHG_3M = 1.1
+CONFIRM_CHG_15M = 2.5
+FAST_STRIKE_CHG = 1.5
+TRI_WINDOW = 180  # 3dk
+LONG_WINDOW = 900  # 15dk
+MAX_DISPLAY_ROWS = 100
 
-# Strateji Ayarları
-DROP_THRESHOLD = 5.0  # %5 Derin Düşüş
-FLAT_BARS = 32  # 8 Saatlik yataylık
-FLAT_THRESHOLD = 5.0  # %5 Yataylık bandı
-OFFLINE_THRESHOLD = 60
 
-
-class MSBRadar:
+class MarketRadar:
     def __init__(self):
+        self.history = {}
         self.signals = []
+        self.stats_top5 = {}  # Günlük sıfırlanacak
+        self.stats_counters = {}  # Günlük sıfırlanacak
         self.lock = threading.RLock()
-        self.headers = {'User-Agent': 'Mozilla/5.0'}
-        self.last_heartbeat = time.time()
-        self.total_scanned = 0
-        self.is_currently_offline = False
-        self.send_telegram_msg(
-            "🛡️ <b>MSB Pro v5 Aktif!</b>\nSinyal hiyerarşisi düzeltildi: ULTRA sinyalleri artık engellenmeyecek.")
+        self.last_heartbeat = 0
+        self.total_pairs = 0
+        # Gün takibi için başlangıç günü
+        self.last_reset_day = datetime.now().day
 
-    def send_telegram_msg(self, text):
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-            requests.post(url, data=payload, timeout=5)
-        except:
-            pass
+    def check_resets(self):
+        """Günün değişip değişmediğini kontrol eder, değişmişse istatistikleri sıfırlar"""
+        now = datetime.now()
+        current_day = now.day
 
-    def get_pairs(self):
-        try:
-            res = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo").json()
-            return [s['symbol'] for s in res['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
-        except:
-            return []
+        if current_day != self.last_reset_day:
+            with self.lock:
+                self.stats_top5.clear()
+                self.stats_counters.clear()
+                self.last_reset_day = current_day
 
-    def get_daily_red_line(self, symbol):
-        try:
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1d&limit=2"
-            res = requests.get(url, headers=self.headers, timeout=3).json()
-            return float(res[0][2])
-        except:
-            return 0.0
-
-    def calculate_macd(self, prices):
-        df = pd.Series(prices)
-        exp1 = df.ewm(span=12, adjust=False).mean()
-        exp2 = df.ewm(span=26, adjust=False).mean()
-        return (exp1 - exp2).values
-
-    def analyze_symbol(self, symbol):
-        try:
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=200"
-            res = requests.get(url, headers=self.headers, timeout=3).json()
-            if not isinstance(res, list) or len(res) < 50: return None
-
-            closes = np.array([float(m[4]) for m in res])
-            highs = np.array([float(m[2]) for m in res])
-            lows = np.array([float(m[3]) for m in res])
-            volumes = np.array([float(m[5]) for m in res])
-            current_p = closes[-1]
-
-            # 1. DERİN DÜŞÜŞ
-            max_48h = np.max(highs)
-            drop_rate = (max_48h - current_p) / max_48h * 100
-            if drop_rate < DROP_THRESHOLD: return None
-
-            # 2. YATAYLIK VE SARI ÇİZGİ
-            h_flat = np.max(highs[-FLAT_BARS:])
-            l_flat = np.min(lows[-FLAT_BARS:])
-            price_range = (h_flat - l_flat) / current_p * 100
-            if price_range > FLAT_THRESHOLD: return None
-            yellow_line = h_flat
-
-            # 3. HACİM ONAYI
-            avg_vol = np.mean(volumes[-21:-1])
-            vol_mult = volumes[-1] / avg_vol if avg_vol > 0 else 0
-
-            # 4. MACD ONAYI
-            macd = self.calculate_macd(closes)
-            macd_now = macd[-1]
-            macd_prev = macd[-2]
-
-            # 5. KIRMIZI ÇİZGİ
-            red_line = self.get_daily_red_line(symbol)
-
-            # --- SİNYAL KARAR (Hiyerarşi Güncellendi) ---
-            # ULTRA olması için: Fiyat sarıyı kırmalı VE (MACD 0 üstünde olmalı VEYA MACD yukarı yönlü çok güçlü olmalı)
-            if current_p > yellow_line and (macd_now > 0 or macd_now > macd_prev):
-                status = "💎 ULTRA MSB"
-            elif current_p > (yellow_line * 0.996):
-                status = "⏳ PRE-MSB"
-            else:
-                return None
-
-            return {
-                "Symbol": symbol.replace("USDT", ""),
-                "Price": current_p,
-                "Drop": round(drop_rate, 1),
-                "Range": round(price_range, 1),
-                "VolStatus": round(vol_mult, 1),
-                "Target": red_line,
-                "Status": status
-            }
-        except:
-            pass
-        return None
-
-    def scanner_loop(self):
-        while True:
-            pairs = self.get_pairs()
-            for symbol in pairs:
-                self.last_heartbeat = time.time()
-                res = self.analyze_symbol(symbol)
-                if res:
-                    self.add_signal(res)
-                self.total_scanned += 1
-                time.sleep(0.3)
-
-    def add_signal(self, res):
+    def process_ticker(self, data):
+        now = time.time()
         with self.lock:
-            # SİNYAL HİYERARŞİSİ VE TEKRAR ENGELLEME
-            can_send = True
-            for s in self.signals[:20]:
-                if s['Symbol'] == res['Symbol']:
-                    time_diff = (datetime.now() - s['raw_time']).seconds
-                    # Eğer son 15 dk içinde zaten ULTRA atılmışsa, bir daha atma
-                    if s['Status'] == "💎 ULTRA MSB" and time_diff < 900:
-                        can_send = False
-                    # Eğer son 15 dk içinde PRE atılmışsa ama YENİ sinyal ULTRA ise, GÖNDER (Yükseltme)
-                    elif s['Status'] == "⏳ PRE-MSB" and res['Status'] == "💎 ULTRA MSB":
-                        can_send = True
-                    # Diğer durumlarda (PRE -> PRE gibi) 15 dk bekle
-                    elif time_diff < 900:
-                        can_send = False
+            self.check_resets()
+            self.last_heartbeat = now
+            self.total_pairs = len(data)
+            for item in data:
+                symbol = item['s']
+                if not symbol.endswith('USDT'): continue
+                price, quote_vol = float(item['c']), float(item['q'])
 
-            if not can_send:
-                return
+                if symbol not in self.history:
+                    self.history[symbol] = deque(maxlen=1200)  # ~20 dk veri
 
-            res['raw_time'] = datetime.now()
-            res['Time'] = res['raw_time'].strftime("%H:%M:%S")
-            self.signals.insert(0, res)
+                self.history[symbol].append((now, price, quote_vol))
+                self.check_logic(symbol, now)
 
-            # Telegram Sinyali
-            msg = (f"🚨 <b>{res['Status']}</b>\n\n"
-                   f"💎 Coin: #{res['Symbol']}\n"
-                   f"💰 Fiyat: {res['Price']}\n"
-                   f"📉 48s Düşüş: -%{res['Drop']}\n"
-                   f"📏 Yataylık: %{res['Range']}\n"
-                   f"📊 Hacim Gücü: {res['VolStatus']}x\n"
-                   f"🎯 <b>Hedef (Kırmızı): {res['Target']}</b>\n"
-                   f"🔍 <a href='https://www.tradingview.com/chart/?symbol=BINANCE:{res['Symbol']}USDT.P'>Grafiği Aç</a>")
-            self.send_telegram_msg(msg)
+    def check_logic(self, symbol, now):
+        hist = list(self.history[symbol])
+        if len(hist) < 20: return
 
-            if len(self.signals) > 100: self.signals.pop()
+        current = hist[-1]
+        data_start_time = hist[0][0]
+        data_age_seconds = now - data_start_time
 
+        past_1m = next((x for x in hist if now - x[0] <= 60), hist[0])
+        past_3m = next((x for x in hist if now - x[0] <= TRI_WINDOW), hist[0])
 
-# UI Kısmı v4 ile aynı...
-st.set_page_config(layout="wide", page_title="MSB v5 Pro")
+        c1 = ((current[1] - past_1m[1]) / past_1m[1]) * 100
+        c3 = ((current[1] - past_3m[1]) / past_3m[1]) * 100
+        vol_3m = current[2] - past_3m[2]
+        vol_1m = current[2] - past_1m[2]
+
+        # 1. FLASH ATTACK
+        if abs(c1) >= FAST_STRIKE_CHG and vol_1m >= 50000:
+            res_type = "PUMP" if c1 > 0 else "DUMP"
+            self.add_signal(symbol, current[1], c1, 0, vol_1m, res_type, "⚡ FLASH")
+            return
+
+        # 2. CONFIRMED TREND
+        if vol_3m >= MIN_VOL_3M and abs(c3) >= MIN_CHG_3M:
+            if data_age_seconds >= LONG_WINDOW:
+                past_15m = hist[0]
+                c15 = ((current[1] - past_15m[1]) / past_15m[1]) * 100
+
+                is_consistent = (c3 > 0 and c15 > 0) or (c3 < 0 and c15 < 0)
+                if is_consistent and abs(c15) >= CONFIRM_CHG_15M:
+                    res_type = "PUMP" if c3 > 0 else "DUMP"
+                    self.add_signal(symbol, current[1], c3, c15, vol_3m, res_type, "💎 CONFIRMED")
+
+    def add_signal(self, symbol, price, chg_main, chg_ref, vol, s_type, mode):
+        t_str = datetime.now().strftime("%H:%M:%S")
+        sym_clean = symbol.replace("USDT", "")
+        with self.lock:
+            # Tekrarı engelle
+            for s in self.signals[:5]:
+                if s.get('Symbol') == sym_clean and s.get('Time', '')[:-1] == t_str[:-1]: return
+
+            # Günlük İstatistikleri Güncelle
+            if sym_clean not in self.stats_top5: self.stats_top5[sym_clean] = {"PUMP": 0, "DUMP": 0}
+            self.stats_top5[sym_clean][s_type] += 1
+
+            if sym_clean not in self.stats_counters: self.stats_counters[sym_clean] = {"PUMP": 0, "DUMP": 0}
+            self.stats_counters[sym_clean][s_type] += 1
+
+            sp = self.stats_counters[sym_clean]["PUMP"]
+            sd = self.stats_counters[sym_clean]["DUMP"]
+
+            self.signals.insert(0, {
+                "Time": t_str, "Symbol": sym_clean, "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                "Chg": chg_main, "Ref": chg_ref, "Vol": vol, "P/D": s_type, "Mode": mode,
+                "SnapP": sp, "SnapD": sd
+            })
+            if len(self.signals) > MAX_DISPLAY_ROWS: self.signals.pop()
 
 
 @st.cache_resource
-def get_radar():
-    radar_obj = MSBRadar()
-    threading.Thread(target=radar_obj.scanner_loop, daemon=True).start()
-    return radar_obj
+def get_radar_instance(): return MarketRadar()
 
 
-radar = get_radar()
-h1, h2 = st.columns([3, 1])
-h1.title("🛡️ MSB v5 Intelligence Radar")
-h2.markdown(f"<div style='text-align:right; margin-top:20px; color:#00ff88; font-weight:bold;'>● SYSTEM LIVE</div>",
+async def binance_worker(radar_obj):
+    uri = "wss://fstream.binance.com/ws/!miniTicker@arr"
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                while True:
+                    msg = await ws.recv()
+                    radar_obj.process_ticker(json.loads(msg))
+        except:
+            await asyncio.sleep(5)
+
+
+# --- UI ---
+st.set_page_config(layout="wide", page_title="SinyalEngineer Daily Radar")
+
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    .status-live { color: #00ff88; font-weight: bold; border: 1px solid #00ff88; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
+    .pump-label { background-color: #00ff88; color: black; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .dump-label { background-color: #ff4b4b; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .stat-card { background-color: #1e2127; padding: 10px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #f1c40f; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-bottom: 1px solid #222; }
+    .sym-link { color: #f1c40f; text-decoration: none; font-weight: bold; font-size: 1.1rem; }
+    .green-arrow { color: #00ff88; font-weight: bold; }
+    .red-arrow { color: #ff4b4b; font-weight: bold; }
+    .row-flash-pump { background-color: rgba(0, 255, 136, 0.2) !important; border-left: 5px solid #00ff88 !important; }
+    .row-flash-dump { background-color: rgba(255, 75, 75, 0.2) !important; border-left: 5px solid #ff4b4b !important; }
+    .row-conf-pump { background-color: rgba(0, 255, 136, 0.08) !important; }
+    .row-conf-dump { background-color: rgba(255, 75, 75, 0.08) !important; }
+    .reset-timer { color: #888; font-size: 0.7rem; font-weight: bold; }
+    </style>
+""", unsafe_allow_html=True)
+
+radar = get_radar_instance()
+if "thread_started" not in st.session_state:
+    threading.Thread(target=lambda: asyncio.run(binance_worker(radar)), daemon=True).start()
+    st.session_state.thread_started = True
+
+# Header
+h1, h2, h3 = st.columns([2, 1, 1])
+h1.title("🛡️ Daily Scalp Radar")
+h1.markdown('<p class="reset-timer">RESETS DAILY AT 00:00 / HER GÜN GECE 00:00\'DA SIFIRLANIR</p>',
             unsafe_allow_html=True)
-s1, s2, s3 = st.columns(3)
-s1.metric("Toplam Tarama", radar.total_scanned)
-s2.metric("Aktif Sinyaller", len(radar.signals))
-s3.metric("Son Veri Akışı", f"{int(time.time() - radar.last_heartbeat)}s önce")
+
+status_html = '<span class="status-live">● SYSTEM LIVE</span>' if (
+                                                                              time.time() - radar.last_heartbeat) < 15 else '<span class="status-offline">● OFFLINE</span>'
+h2.markdown(f"<div style='margin-top:10px;'>{status_html}</div>", unsafe_allow_html=True)
+h2.markdown(
+    f'<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">𝕏 @SinyalEngineer</a>',
+    unsafe_allow_html=True)
+h3.metric("Pairs Tracked", radar.total_pairs)
+
 st.divider()
-if not radar.signals:
-    st.info("Piyasa taranıyor... ULTRA sinyalleri için kırılım bekleniyor.")
-else:
-    for sig in radar.signals:
-        color = "#00ff88" if "ULTRA" in sig['Status'] else "#f1c40f"
-        with st.container():
-            st.markdown(f"""
-            <div style="background-color: #1e2127; padding: 15px; border-radius: 10px; border-left: 5px solid {color}; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <b style="font-size: 1.3rem; color: #f1c40f;">#{sig['Symbol']}</b> 
-                    <span style="color: {color}; margin-left:10px;">{sig['Status']}</span>
-                </div>
-                <div style="text-align: center;">
-                    <small style="color: #bdc3c7;">Fiyat</small><br><b>{sig['Price']}</b>
-                </div>
-                <div style="text-align: center;">
-                    <small style="color: #bdc3c7;">Hacim</small><br><b style="color:#00ff88;">{sig['VolStatus']}x</b>
-                </div>
-                <div style="text-align: center;">
-                    <small style="color: #bdc3c7;">Hedef (Kırmızı)</small><br><b style="color:#ff4b4b;">{sig['Target']}</b>
-                </div>
-                <div>
-                    <a href="https://www.tradingview.com/chart/?symbol=BINANCE:{sig['Symbol']}USDT.P" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">GRAFİK ↗</a>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-time.sleep(4)
-st.rerun()
+
+col_side, col_main = st.columns([1, 4])
+with col_main:
+    header_col, search_col = st.columns([3, 1])
+    header_col.subheader("📡 Live Signals")
+    search_query = search_col.text_input("Filter", placeholder="🔍 Sym...", label_visibility="collapsed",
+                                         key="gs").upper()
+
+placeholder_side = col_side.empty()
+placeholder_main = col_main.empty()
+
+while True:
+    with placeholder_side.container():
+        st.subheader("🔥 Top 10 (Daily)")
+        with radar.lock:
+            s_top = getattr(radar, 'stats_top5', {})
+            # Burada Top 10 için dilimleme [:10] olarak güncellendi
+            sorted_stats = sorted(s_top.items(), key=lambda x: x[1]['PUMP'] + x[1]['DUMP'], reverse=True)[:10]
+            if not sorted_stats: st.write("Refreshing...")
+            for sym, counts in sorted_stats:
+                tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
+                st.markdown(f'''<div class="stat-card"><a href="{tv_url}" target="_blank" class="sym-link">{sym}</a><br>
+                <small><span class="green-arrow">↑ {counts["PUMP"]}</span> | <span class="red-arrow">↓ {counts["DUMP"]}</span></small></div>''',
+                            unsafe_allow_html=True)
+
+    with placeholder_main.container():
+        with radar.lock:
+            signals = list(getattr(radar, 'signals', []))
+            display_data = [s for s in signals if search_query in s.get('Symbol', '')] if search_query else signals
+            if display_data:
+                html = "<table><tr><th>Time</th><th>Symbol (Daily ↑/↓)</th><th>Price</th><th>Mtm.</th><th>15m Ref</th><th>Vol</th><th>Status</th><th>Type</th></tr>"
+                for row in display_data:
+                    sym = row.get('Symbol');
+                    p_count = row.get('SnapP');
+                    d_count = row.get('SnapD')
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
+                    chg = row.get('Chg');
+                    ref = row.get('Ref');
+                    vol = row.get('Vol');
+                    p_type = row.get('P/D');
+                    mode = row.get('Mode')
+
+                    row_class = ""
+                    if "FLASH" in mode:
+                        row_class = ' class="row-flash-pump"' if p_type == "PUMP" else ' class="row-flash-dump"'
+                    else:
+                        row_class = ' class="row-conf-pump"' if p_type == "PUMP" else ' class="row-conf-dump"'
+
+                    html += f"<tr{row_class}><td>{row.get('Time')}</td>"
+                    html += f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}</a> <small class='green-arrow'>↑{p_count}</small> <small class='red-arrow'>↓{d_count}</small></td>"
+                    html += f"<td>{row.get('Price')}</td>"
+                    html += f"<td style='font-weight:bold;'>{chg:+.2f}%</td>"
+                    html += f"<td>{ref:+.2f}%</td>"
+                    html += f"<td>{vol / 1000:.0f}k</td>"
+                    html += f"<td><b style='color:#f1c40f;'>{mode}</b></td>"
+                    html += f"<td><span class='{'pump-label' if p_type == 'PUMP' else 'dump-label'}'>{p_type}</span></td></tr>"
+                st.markdown(html + "</table>", unsafe_allow_html=True)
+            else:
+                st.info("Piyasa taranıyor... 🔍")
+    time.sleep(1)
